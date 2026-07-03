@@ -1,0 +1,224 @@
+Let me teach IAM properly first, then we'll create the posts and notes together so they accurately reflect what you've actually learned — same approach as every other day.
+
+---
+
+# Day 12 — Azure IAM: Service Principals, Managed Identities, Users, Groups, Roles
+
+---
+
+## Why IAM exists — First Principles
+
+**The problem:** you have resources in Azure (VMs, storage accounts, databases, firewalls) and multiple entities that need to interact with them — developers, applications, scripts, CI/CD pipelines, other Azure services. Without access control, anyone or anything could do anything to any resource — delete a production database, read secrets, modify firewall rules.
+
+**The answer:** IAM (Identity and Access Management) — a system that answers three questions for every action attempted on any resource:
+
+```
+1. WHO are you?        (Authentication — Identity)
+2. WHAT are you allowed to do?  (Authorization — Role)
+3. WHERE can you do it?    (Scope — Resource/Group/Subscription)
+```
+
+---
+
+## Azure IAM building blocks — the full picture before diving into each
+
+```
+Identity (WHO)          Role (WHAT)         Scope (WHERE)
+─────────────────       ──────────────       ──────────────
+User                    Owner               Management Group
+Group                   Contributor         Subscription
+Service Principal       Reader              Resource Group
+Managed Identity        Custom Role         Individual Resource
+```
+
+A **Role Assignment** connects all three: "This identity can do these actions on this scope."
+
+---
+
+## 1. Users and Groups
+
+**Users** — human identities, typically employees/developers who sign into Azure with a username and password (or MFA). Managed in **Azure Active Directory (Azure AD)**, now rebranded as **Microsoft Entra ID**.
+
+**Groups** — a collection of users. Instead of assigning roles to 50 individual users, you assign a role to a group once, and add/remove users from the group.
+
+**Same principle as Linux Day 1:** `useradd`, `groupadd`, `usermod -aG` — you already understand this mental model. Azure Groups are just the cloud-scale version of the same idea: manage permissions at the group level, not the individual level.
+
+```bash
+# Create a group via CLI
+az ad group create --display-name "DevOps-Team" --mail-nickname "devops-team"
+
+# Add a user to the group
+az ad group member add --group "DevOps-Team" --member-id <user-object-id>
+```
+
+---
+
+## 2. Roles — What Actions Are Actually Allowed
+
+Azure uses **RBAC (Role-Based Access Control)** — you assign roles that define what actions an identity can perform.
+
+**Three most important built-in roles:**
+
+```
+Owner        → full control including managing access (assigning roles to others)
+Contributor  → can create/manage resources but CANNOT manage access
+Reader       → read-only, can see everything but change nothing
+```
+
+**Thinker question:** why is "Contributor" and "Owner" separated — why not just have one "full access" role?
+
+(Answer: least privilege in action. A developer might need to create/manage VMs and storage — Contributor covers that. But you don't want developers to also be able to grant themselves or others elevated access, which Owner allows. Separating "can manage resources" from "can manage access" is a critical security boundary — if a Contributor account gets compromised, the attacker can't escalate their own permissions.)
+
+**Assigning a role via CLI:**
+```bash
+az role assignment create \
+  --assignee <user-or-group-object-id> \
+  --role "Contributor" \
+  --scope /subscriptions/<subscription-id>/resourceGroups/your-rg
+```
+
+---
+
+## 3. Scope — Where the Role Applies
+
+A role assignment without a scope means nothing — scope defines **where** the permissions apply in Azure's hierarchy:
+
+```
+Management Group (top — multiple subscriptions)
+    ↓
+Subscription
+    ↓
+Resource Group
+    ↓
+Individual Resource (e.g., one specific storage account)
+```
+
+**Permissions inherit downward** — a Contributor role on a Resource Group means Contributor access to every resource inside that group. A Reader role on a Subscription means Reader access to every resource group and resource in that subscription.
+
+**Why this matters practically:** assign roles at the **lowest scope that makes sense**. A developer who only needs access to one storage account shouldn't get Contributor on the entire subscription — give them Contributor on that specific storage account only. Same least-privilege principle, applied at the scope level.
+
+---
+
+## 4. Service Principals — Non-Human Identities for Applications
+
+**The problem:** your CI/CD pipeline needs to deploy infrastructure to Azure. Your application running on an external server needs to read from a blob container. These aren't humans — you can't give them a username and password and have them click through an MFA prompt.
+
+**The answer:** a **Service Principal** — an identity specifically created for an application, script, or automated process, with its own credentials (client ID + secret, or certificate).
+
+```bash
+# Create a service principal with Contributor role on a resource group
+az ad sp create-for-rbac \
+  --name "devops-pipeline-sp" \
+  --role Contributor \
+  --scopes /subscriptions/<subscription-id>/resourceGroups/your-rg \
+  --output json
+```
+
+Output:
+```json
+{
+  "appId": "xxxxx",       ← client ID (like a username)
+  "password": "xxxxx",    ← client secret (like a password, shown ONCE)
+  "tenant": "xxxxx"       ← your Azure AD tenant ID
+}
+```
+
+**Real use case:** your GitHub Actions CI/CD pipeline uses these three values as secrets to authenticate to Azure and deploy Terraform — exactly what you'll configure in a future module.
+
+**The security concern with Service Principals:** the secret (`password`) is a credential that can be stolen, leaked, or expired. It needs to be stored securely (Azure Key Vault, GitHub Secrets) and rotated regularly.
+
+---
+
+## 5. Managed Identities — Service Principals Without the Secret Problem
+
+**The problem with Service Principals:** you have to manage credentials — create them, store them securely, rotate them before they expire, make sure they don't get accidentally committed to GitHub. This is a real operational burden and a common source of security incidents ("oops, I committed the client secret to a public repo").
+
+**The answer:** Managed Identities — Azure automatically creates and manages the credential for you, completely invisibly. No secret to store, no rotation to manage, no credential to leak.
+
+**How it works, first principles:**
+
+```
+Normal auth:     App → "here's my client ID and secret" → Azure AD → access token → Azure resource
+Managed Identity: App → "I am this VM/Function/Container" → Azure AD verifies with Azure internally → access token → Azure resource
+```
+
+The credential exchange happens entirely within Azure's own infrastructure — your application never sees or handles a secret at all.
+
+**Two types:**
+
+```
+System-assigned → tied to ONE specific Azure resource (VM, Function App, etc.)
+                  created and deleted WITH that resource
+                  cannot be shared across resources
+
+User-assigned   → an independent resource you create separately
+                  can be assigned to MULTIPLE Azure resources
+                  survives if the attached resource is deleted
+```
+
+**Enable a system-assigned managed identity on a VM via CLI:**
+```bash
+az vm identity assign \
+  --name your-vm-name \
+  --resource-group your-rg
+```
+
+**Give that VM's identity access to a storage account:**
+```bash
+az role assignment create \
+  --assignee <vm-managed-identity-principal-id> \
+  --role "Storage Blob Data Contributor" \
+  --scope /subscriptions/<sub-id>/resourceGroups/your-rg/providers/Microsoft.Storage/storageAccounts/your-storage
+```
+
+**Now the VM can access that storage account from its own code with zero credentials:**
+```python
+from azure.identity import ManagedIdentityCredential
+from azure.storage.blob import BlobServiceClient
+
+credential = ManagedIdentityCredential()
+client = BlobServiceClient(account_url="https://yourstorage.blob.core.windows.net", credential=credential)
+```
+
+No client ID, no secret, no key — the VM's own identity is the credential.
+
+---
+
+## 6. The Full Picture — When to Use What
+
+```
+Human developer/admin        → User + Group + Role Assignment
+Multiple developers same access → Group (not individual assignments)
+CI/CD pipeline (external)    → Service Principal + secret stored in GitHub Secrets/Key Vault
+Azure resource accessing another Azure resource → Managed Identity (always prefer over SP)
+```
+
+**The golden rule:** whenever something runs INSIDE Azure (a VM, a Function App, a Container) and needs to access another Azure resource — **always use Managed Identity over Service Principal.** No credentials to manage, no secrets to leak, same result.
+
+---
+
+## Connecting this to everything you've already built
+
+```
+Day 1:  useradd, groupadd, sudo, least privilege on Linux
+        ↓ same principle, cloud scale
+Day 12: Users, Groups, Roles, RBAC on Azure
+
+Day 10: NSG rules — only allow specific traffic from specific sources
+        ↓ same principle, identity layer
+Day 12: Role assignments — only allow specific actions from specific identities
+
+Day 11: Stored Terraform state in Blob Storage
+        ↓ how does Terraform authenticate to that storage?
+Day 12: Service Principal or Managed Identity — now you know
+```
+
+---
+
+## Thinker question before we write today's posts
+
+> Your VM needs to read secrets from Azure Key Vault and write logs to a Blob Storage container. You have two options: (1) create a Service Principal, store its secret in the VM's environment variables, and use it to authenticate. Or (2) assign a Managed Identity to the VM and give it the right roles on Key Vault and Storage.
+>
+> What are the specific risks of Option 1 that Option 2 eliminates, and is there any scenario where you'd still choose Option 1 over Option 2?
+
+Answer this — it's a real interview question — then we'll write the posts and MD file.
