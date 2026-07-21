@@ -1,3 +1,4 @@
+// Terraform configuration for Azure Resource Group
 terraform {
   required_providers {
     azurerm = {
